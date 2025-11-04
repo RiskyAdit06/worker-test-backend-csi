@@ -1,64 +1,137 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400"></a></p>
+## 🔧 Cara Menjalankan
 
-<p align="center">
-<a href="https://travis-ci.org/laravel/framework"><img src="https://travis-ci.org/laravel/framework.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+Berikut langkah-langkah untuk menjalankan proyek ini di lokal:
 
-## About Laravel
+## 1. Clone repository
+```bash
+## git clone nama repo berikut
+https://github.com/RiskyAdit06/worker-test-backend-csi
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## masuk ke folder repo cd worker-test-backend-csi
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+## Install dependencies
+Jalankan composer install
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+## Setup environment
+Buat file .env berdasarkan .env.example yang sudah ada
 
-## Learning Laravel
+## Migrasi database
+jalankan perintah php artisan migrate
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+## Jalankan API
+jalankan perintah
+php artisan serve
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains over 1500 video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+## Jalankan Worker
+buka di powershell lain dan jalankan perintah
+php artisan jobs:worker --sleep=1 
 
-## Laravel Sponsors
+## 2. 🛠 Penjelasan Keputusan Teknis
+1. Polling Worker + DB Transaction
+- Worker dijalankan secara terus-menerus menggunakan looping (while(true)), mengambil job yang statusnya PENDING atau RETRY.
+- Setiap pengambilan job dibungkus dalam transaction, sehingga status update menjadi atomik. Jika terjadi error di tengah proses, DB akan rollback otomatis.
+- Ini memastikan reliability, karena job tidak hilang atau diproses secara ganda.
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the Laravel [Patreon page](https://patreon.com/taylorotwell).
+2. lockForUpdate()
+- Saat worker mengambil job, digunakan lockForUpdate() untuk mengunci row di database.
+- Tujuannya: prevent race condition ketika ada lebih dari satu worker berjalan paralel. Hanya satu worker yang bisa mengklaim job untuk diproses sehingga lebih aman dari double-processing.
 
-### Premium Partners
+3. Idempotency Key
+- API enqueue job menerima idempotency_key.
+- Jika ada request dengan idempotency_key yang sama dan payload identik, tidak membuat job baru, tetapi mengembalikan job existing.Ini mencegah duplikasi job akibat retry client atau request duplikat → idempotency.
 
-- **[Vehikl](https://vehikl.com/)**
-- **[Tighten Co.](https://tighten.co)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Cubet Techno Labs](https://cubettech.com)**
-- **[Cyber-Duck](https://cyber-duck.co.uk)**
-- **[Many](https://www.many.co.uk)**
-- **[Webdock, Fast VPS Hosting](https://www.webdock.io/en)**
-- **[DevSquad](https://devsquad.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel/)**
-- **[OP.GG](https://op.gg)**
-- **[WebReinvent](https://webreinvent.com/?utm_source=laravel&utm_medium=github&utm_campaign=patreon-sponsors)**
-- **[Lendio](https://lendio.com)**
+4. Sederhana & konsisten
+- Kode memanfaatkan DB sebagai single source of truth. Tidak menggunakan queue eksternal seperti RabbitMQ/SQS, sesuai batasan soal.
+- Semua logic retry, backoff, dan status update dilakukan di worker sendiri, membuat alur lebih mudah dipahami dan di-debug.
 
-## Contributing
+⏱ Strategi Retry / Backoff / Jitter
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+1. Retry
+- Job yang gagal sementara (30% chance fail) akan diupdate statusnya menjadi RETRY.
+- Jumlah attempts ditambah +1 setiap gagal.
+- Jika attempts >= max_attempts → job berstatus FAILED.
 
-## Code of Conduct
+2. Exponential Backoff
+- Delay dihitung sebagai:
+    delay = 2^(attempts - 1) detik
+- Contoh:
+    Attempt 1 → 1 detik
+    Attempt 2 → 2 detik
+    Attempt 3 → 4 detik, dst.
+- Ini dapat mengurangi beban dari sistem jika banyak job gagal secara bersamaan.
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+3. Jitter
+- Ditambahkan random 0–30% ke delay:
+    delay = base * (1 + jitter)
+- Contoh: 4 detik → 4–5.2 detik
+- Tujuannya: menghindari thundering herd, yaitu semua worker mencoba job sekaligus setelah delay yang sama.
 
-## Security Vulnerabilities
+4. Pengaturan next_run_at
+- Worker hanya mengambil job yang next_run_at <= now().
+- Jadi job yang di-retry otomatis akan menunggu sesuai delay sebelum diambil kembali.
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+🔒 Mekanisme Anti Double-Processing
 
-## License
+1. Row-level Locking
+- lockForUpdate() berfungsi untuk memastikan satu worker hanya bisa mengklaim satu job pada satu waktu.
+- Kemudian worker lain harus menunggu commit atau rollback untuk row yang sama.
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+2. Status Transition Atomik
+- Setelah mengambil job, worker langsung mengupdate status menjadi PROCESSING.
+- Ini menandai job sedang diproses dan worker lain tidak akan memproses job yang sama.
+
+3. Transaction Safety
+- Semua data diupdate yang statusnya (PROCESSING, SUCCESS, RETRY, FAILED) dan itu dilakukan di dalam transaksi.
+- Jika worker crash saat memproses job, transaksi akan rollback dan job tetap bisa diambil worker lain pada polling berikutnya dan begitu seterusnya.
+
+4. Idempotency
+- API dan worker sama-sama mengandalkan DB sebagai single source of truth.
+- Tidak ada job yang bisa diproses secara ganda, bahkan jika ada banyak worker paralel atau restart worker di tengah proses.
+
+📬 Sample Requests
+1️⃣ Enqueue Job (POST /api/notifications)
+
+POST http://localhost:8000/api/notifications
+Content-Type: application/json
+{`
+  "recipient": "user@example.com",
+  "channel": "email",
+  "message": "Halo dari sistem worker!",
+  "idempotency_key": "test-key-1"
+}`
+
+## Expected Response
+{`
+  "job_id": 1,
+  "status": "PENDING"
+}`
+
+2️⃣ Enqueue Duplicate Job (Idempotency Test)
+POST http://localhost:8000/api/notifications
+Content-Type: application/json
+
+{`
+  "recipient": "user@example.com",
+  "channel": "email",
+  "message": "Halo dari sistem worker!",
+  "idempotency_key": "test-key-1"
+}`
+
+## Expected Response
+`{
+  "job_id": 1,
+  "status": "PENDING"
+}`
+
+3️⃣ Queue Stats (GET /internal/queue/stats)
+http://127.0.0.1:8000/api/internal/queue/stats
+
+## Expected Response
+{`
+  "pending": 5,
+  "retry": 2,
+  "processing": 1,
+  "success": 120,
+  "failed": 4,
+  "avg_attempts_success": 1.4
+}`
